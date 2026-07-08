@@ -91,6 +91,33 @@ def _normalize_code(raw: Any) -> str:
     return s
 
 
+def _akshare_market_for_code(raw: Any) -> Optional[str]:
+    s = _safe_str(raw).upper()
+    if "." in s:
+        suffix = s.rsplit(".", 1)[1]
+        if suffix in {"SH", "SS"}:
+            return "sh"
+        if suffix == "SZ":
+            return "sz"
+        if suffix == "BJ":
+            return "bj"
+    if s.startswith("SH"):
+        return "sh"
+    if s.startswith("SZ"):
+        return "sz"
+    if s.startswith("BJ"):
+        return "bj"
+
+    code = _normalize_code(raw)
+    if code.startswith("6"):
+        return "sh"
+    if code.startswith(("0", "2", "3")):
+        return "sz"
+    if code.startswith(("4", "8")):
+        return "bj"
+    return None
+
+
 def _pick_by_keywords(row: pd.Series, keywords: List[str]) -> Optional[Any]:
     """
     Return first non-empty row value whose column name contains any keyword.
@@ -425,13 +452,18 @@ class AkshareFundamentalAdapter:
             "errors": [],
         }
 
-        stock_df, stock_source, stock_errors = self._call_df_candidates([
-            ("stock_individual_fund_flow", {"stock": stock_code}),
-            ("stock_individual_fund_flow", {"symbol": stock_code}),
-            ("stock_individual_fund_flow", {}),
-            ("stock_main_fund_flow", {"symbol": stock_code}),
-            ("stock_main_fund_flow", {}),
-        ])
+        plain_code = _normalize_code(stock_code)
+        market = _akshare_market_for_code(stock_code)
+        stock_candidates: List[Tuple[str, Dict[str, Any]]] = []
+        if plain_code and market:
+            stock_candidates.append(("stock_individual_fund_flow", {"stock": plain_code, "market": market}))
+        elif plain_code:
+            stock_candidates.append(("stock_individual_fund_flow", {"stock": plain_code}))
+        main_flow_symbol = {"sh": "沪市A股", "sz": "深市A股"}.get(market or "")
+        if main_flow_symbol:
+            stock_candidates.append(("stock_main_fund_flow", {"symbol": main_flow_symbol}))
+
+        stock_df, stock_source, stock_errors = self._call_df_candidates(stock_candidates)
         result["errors"].extend(stock_errors)
         if stock_df is not None:
             row = _extract_latest_row(stock_df, stock_code)

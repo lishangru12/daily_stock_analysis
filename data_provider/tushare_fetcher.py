@@ -1114,6 +1114,352 @@ class TushareFetcher(BaseFetcher):
         # 获取为空或者接口调用失败，返回 None
         return None
     
+    def get_concept_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
+        """获取概念/题材涨跌榜(Tushare Pro)，失败时交给后续数据源兜底。"""
+        start_date = self.get_trade_time(early_time='00:00', late_time='15:30')
+        if not start_date:
+            return None
+
+        logger.info("[Tushare] ts.pro_api().moneyflow_ind_dc 获取概念排行(东财)...")
+        try:
+            df = self._call_api_with_rate_limit("moneyflow_ind_dc", trade_date=start_date)
+            if df is None or df.empty:
+                return None
+
+            content_col = next((col for col in ("content_type", "type") if col in df.columns), None)
+            name_col = next((col for col in ("name", "industry") if col in df.columns), None)
+            change_col = next((col for col in ("pct_change", "change_pct") if col in df.columns), None)
+            if not content_col or not name_col or not change_col:
+                return None
+
+            work_df = df.copy()
+            concept_mask = work_df[content_col].astype(str).str.contains(
+                r"概念|题材|concept|theme",
+                case=False,
+                na=False,
+                regex=True,
+            )
+            work_df = work_df[concept_mask]
+            if work_df.empty:
+                return None
+
+            work_df[change_col] = pd.to_numeric(work_df[change_col], errors='coerce')
+            work_df = work_df.dropna(subset=[change_col])
+            if work_df.empty:
+                return None
+
+            top = work_df.nlargest(n, change_col)
+            bottom = work_df.nsmallest(n, change_col)
+            return (
+                [
+                    {'name': str(row[name_col]), 'change_pct': float(row[change_col])}
+                    for _, row in top.iterrows()
+                ],
+                [
+                    {'name': str(row[name_col]), 'change_pct': float(row[change_col])}
+                    for _, row in bottom.iterrows()
+                ],
+            )
+        except Exception as e:
+            logger.warning(f"[Tushare] 获取东财概念板块涨跌榜失败: {e}")
+            return None
+
+    @staticmethod
+    def _latest_tushare_row(df: Optional[pd.DataFrame]) -> Optional[pd.Series]:
+        if df is None or df.empty:
+            return None
+        work_df = df.copy()
+        for col in ("end_date", "ann_date", "record_date", "ex_date", "trade_date"):
+            if col in work_df.columns:
+                work_df[col] = work_df[col].astype(str)
+                work_df = work_df.sort_values(col, ascending=False)
+                break
+        return work_df.iloc[0]
+
+    @staticmethod
+    def _pick_number(row: Optional[pd.Series], *columns: str) -> Optional[float]:
+        if row is None:
+            return None
+        for col in columns:
+            if col not in row:
+                continue
+            value = pd.to_numeric(pd.Series([row[col]]), errors="coerce").iloc[0]
+            if pd.notna(value):
+                return float(value)
+        return None
+
+    @staticmethod
+    def _pick_text(row: Optional[pd.Series], *columns: str) -> Optional[str]:
+        if row is None:
+            return None
+        for col in columns:
+            if col not in row:
+                continue
+            value = row[col]
+            if value is None or pd.isna(value):
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return None
+
+    @staticmethod
+    def _format_tushare_date(value: Any) -> Optional[str]:
+        if value is None or pd.isna(value):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            parsed = pd.to_datetime(text, format="%Y%m%d" if text.isdigit() and len(text) == 8 else None)
+        except Exception:
+            return text
+        return parsed.strftime("%Y-%m-%d")
+
+    @classmethod
+    def _summary_from_row(cls, row: Optional[pd.Series], fields: List[str]) -> str:
+        if row is None:
+            return ""
+        parts: List[str] = []
+        for field in fields:
+            if field not in row:
+                continue
+            value = row[field]
+            if value is None or pd.isna(value):
+                continue
+            text = str(value).strip()
+            if text:
+                parts.append(f"{field}={text}")
+        return "; ".join(parts)[:200]
+
+    @classmethod
+    def _build_tushare_dividend_payload(cls, df: Optional[pd.DataFrame], max_events: int = 5) -> Dict[str, Any]:
+        if df is None or df.empty or "cash_div_tax" not in df.columns:
+            return {}
+        work_df = df.copy()
+        date_col = next((c for c in ("ex_date", "record_date", "ann_date", "end_date") if c in work_df.columns), None)
+        if date_col:
+            work_df[date_col] = work_df[date_col].astype(str)
+            work_df = work_df.sort_values(date_col, ascending=False)
+        cash_values = pd.to_numeric(work_df["cash_div_tax"], errors="coerce")
+        events: List[Dict[str, Any]] = []
+        dated_amounts: List[Tuple[datetime, float]] = []
+        for idx, row in work_df.iterrows():
+            cash = cash_values.loc[idx]
+            if pd.isna(cash):
+                continue
+            per_share = float(cash) / 10.0
+            event = {
+                "report_date": cls._format_tushare_date(row.get("end_date")) if "end_date" in row else None,
+                "record_date": cls._format_tushare_date(row.get("record_date")) if "record_date" in row else None,
+                "ex_dividend_date": cls._format_tushare_date(row.get("ex_date")) if "ex_date" in row else None,
+                "cash_dividend_per_share": per_share,
+            }
+            events.append({k: v for k, v in event.items() if v is not None})
+            raw_date = row.get(date_col) if date_col else None
+            try:
+                parsed_date = pd.to_datetime(str(raw_date), format="%Y%m%d").to_pydatetime()
+                dated_amounts.append((parsed_date, per_share))
+            except Exception:
+                continue
+            if len(events) >= max_events:
+                break
+
+        if not events:
+            return {}
+
+        ttm_count = 0
+        ttm_cash = 0.0
+        cutoff = datetime.now() - timedelta(days=365)
+        for event_date, per_share in dated_amounts:
+            if event_date >= cutoff:
+                ttm_count += 1
+                ttm_cash += per_share
+
+        return {
+            "events": events[:max_events],
+            "ttm_event_count": ttm_count,
+            "ttm_cash_dividend_per_share": round(ttm_cash, 6) if ttm_count else None,
+            "source": "tushare.dividend",
+        }
+
+    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+        """
+        Return normalized growth / earnings / institution blocks from Tushare Pro.
+        """
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "growth": {},
+            "earnings": {},
+            "institution": {},
+            "source_chain": [],
+            "errors": [],
+        }
+
+        if _is_us_code(stock_code) or _is_hk_market(stock_code) or _is_etf_code(stock_code):
+            result["errors"].append("not supported")
+            return result
+
+        try:
+            ts_code = self._convert_stock_code(stock_code)
+        except Exception as exc:
+            result["errors"].append(f"tushare_bundle_code:{type(exc).__name__}")
+            return result
+
+        frames: Dict[str, Optional[pd.DataFrame]] = {}
+        for api_name in (
+            "fina_indicator",
+            "income",
+            "cashflow",
+            "forecast",
+            "express",
+            "dividend",
+            "stk_holdernumber",
+        ):
+            try:
+                frames[api_name] = self._call_api_with_rate_limit(api_name, ts_code=ts_code)
+            except Exception as exc:
+                frames[api_name] = None
+                result["errors"].append(f"{api_name}:{type(exc).__name__}")
+
+        fina_row = self._latest_tushare_row(frames.get("fina_indicator"))
+        income_row = self._latest_tushare_row(frames.get("income"))
+        cashflow_row = self._latest_tushare_row(frames.get("cashflow"))
+        forecast_row = self._latest_tushare_row(frames.get("forecast"))
+        express_row = self._latest_tushare_row(frames.get("express"))
+        holder_df = frames.get("stk_holdernumber")
+
+        growth_payload = {
+            "revenue_yoy": self._pick_number(fina_row, "tr_yoy", "or_yoy", "q_gr_yoy"),
+            "net_profit_yoy": self._pick_number(fina_row, "netprofit_yoy", "dt_netprofit_yoy", "q_netprofit_yoy"),
+            "roe": self._pick_number(fina_row, "roe", "roe_waa", "roe_yearly"),
+            "gross_margin": self._pick_number(fina_row, "grossprofit_margin", "gross_margin", "q_gsprofit_margin"),
+        }
+        growth_payload = {k: v for k, v in growth_payload.items() if v is not None}
+        if growth_payload:
+            result["growth"] = growth_payload
+
+        financial_report = {
+            "report_date": self._format_tushare_date(
+                self._pick_text(income_row, "end_date") or self._pick_text(fina_row, "end_date")
+            ),
+            "revenue": self._pick_number(income_row, "total_revenue", "revenue"),
+            "net_profit_parent": self._pick_number(income_row, "n_income_attr_p", "n_income"),
+            "operating_cash_flow": self._pick_number(cashflow_row, "n_cashflow_act", "net_cash_flows_oper_act"),
+            "roe": growth_payload.get("roe"),
+        }
+        financial_report = {k: v for k, v in financial_report.items() if v is not None}
+        if financial_report:
+            result["earnings"]["financial_report"] = financial_report
+
+        forecast_summary = self._summary_from_row(
+            forecast_row,
+            ["type", "p_change_min", "p_change_max", "net_profit_min", "net_profit_max", "summary", "change_reason"],
+        )
+        if forecast_summary:
+            result["earnings"]["forecast_summary"] = forecast_summary
+
+        quick_summary = self._summary_from_row(
+            express_row,
+            ["revenue", "operate_profit", "total_profit", "n_income", "yoy_net_profit", "yoy_sales"],
+        )
+        if quick_summary:
+            result["earnings"]["quick_report_summary"] = quick_summary
+
+        dividend_payload = self._build_tushare_dividend_payload(frames.get("dividend"))
+        if dividend_payload:
+            result["earnings"]["dividend"] = dividend_payload
+
+        if holder_df is not None and not holder_df.empty and "holder_num" in holder_df.columns:
+            holder_work = holder_df.copy()
+            if "end_date" in holder_work.columns:
+                holder_work["end_date"] = holder_work["end_date"].astype(str)
+                holder_work = holder_work.sort_values("end_date", ascending=False)
+            holder_numbers = pd.to_numeric(holder_work["holder_num"], errors="coerce").dropna().tolist()
+            if holder_numbers:
+                holder_payload: Dict[str, Any] = {
+                    "shareholder_count": int(holder_numbers[0]),
+                }
+                latest_holder_row = holder_work.iloc[0]
+                if "end_date" in latest_holder_row:
+                    report_date = self._format_tushare_date(latest_holder_row["end_date"])
+                    if report_date:
+                        holder_payload["report_date"] = report_date
+                if len(holder_numbers) > 1:
+                    holder_payload["shareholder_count_change"] = int(holder_numbers[0] - holder_numbers[1])
+                result["institution"] = holder_payload
+
+        if result["growth"] or result["earnings"] or result["institution"]:
+            result["status"] = "partial"
+            result["source_chain"].append("fundamental_bundle:tushare")
+        return result
+
+    def get_capital_flow(self, stock_code: str) -> Dict[str, Any]:
+        """
+        Return individual A-share money flow from Tushare Pro moneyflow.
+        """
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "stock_flow": {},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": [],
+            "errors": [],
+        }
+
+        if _is_us_code(stock_code) or _is_hk_market(stock_code) or _is_etf_code(stock_code):
+            result["errors"].append("not supported")
+            return result
+
+        try:
+            trade_dates = self._get_trade_dates()
+            if not trade_dates:
+                result["errors"].append("empty_trade_calendar")
+                return result
+
+            window_dates = trade_dates[:10]
+            if not window_dates:
+                result["errors"].append("empty_trade_window")
+                return result
+
+            ts_code = self._convert_stock_code(stock_code)
+            end_date = window_dates[0]
+            start_date = window_dates[-1]
+            df = self._call_api_with_rate_limit(
+                "moneyflow",
+                ts_code=ts_code,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except Exception as exc:
+            result["errors"].append(f"tushare_moneyflow:{type(exc).__name__}")
+            return result
+
+        if df is None or df.empty:
+            result["errors"].append("empty_tushare_moneyflow")
+            return result
+
+        flow_col = next((c for c in ("net_mf_amount", "net_amount", "net_mf_vol") if c in df.columns), None)
+        if flow_col is None:
+            result["errors"].append("missing_tushare_moneyflow_net_column")
+            return result
+
+        work_df = df.copy()
+        if "trade_date" in work_df.columns:
+            work_df["trade_date"] = work_df["trade_date"].astype(str)
+            work_df = work_df.sort_values("trade_date", ascending=False)
+        values = pd.to_numeric(work_df[flow_col], errors="coerce").dropna()
+        if values.empty:
+            result["errors"].append("empty_tushare_moneyflow_net_values")
+            return result
+
+        result["stock_flow"] = {
+            "main_net_inflow": float(values.iloc[0]),
+            "inflow_5d": float(values.head(5).sum()),
+            "inflow_10d": float(values.head(10).sum()),
+        }
+        result["source_chain"].append("capital_stock:tushare_moneyflow")
+        result["status"] = "partial"
+        return result
     
 
     

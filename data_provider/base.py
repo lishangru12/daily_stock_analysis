@@ -646,7 +646,7 @@ class DataFetcherManager:
         self._stock_name_cache: Dict[str, str] = {}
         self._stock_name_cache_lock = RLock()
         
-        if fetchers:
+        if fetchers is not None:
             # 按优先级排序
             self._fetchers = sorted(fetchers, key=lambda f: f.priority)
             self._refresh_fetcher_indexes_locked()
@@ -3210,36 +3210,84 @@ class DataFetcherManager:
             [valuation_err] if valuation_err else [],
         )
 
-        # growth / earnings / institution (one AkShare call)
+        # growth / earnings / institution (Tushare-capable fetcher first, AkShare fallback)
         if remaining_seconds <= 0:
             bundle_status = "failed"
             bundle_payload: Dict[str, Any] = {}
             bundle_errors = ["fundamental stage timeout"]
             bundle_ms = 0
         else:
-            bundle_timeout = min(fetch_timeout, remaining_seconds)
-            bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
-                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
-                bundle_timeout,
-                "fundamental_bundle",
-            )
-            _consume_budget(bundle_ms)
+            bundle_source_prefix: List[Dict[str, Any]] = []
+            bundle_fallback_errors: List[str] = []
+            bundle_payload = None
+            bundle_err_msg = None
+            bundle_ms = 0
+
+            def _has_usable_bundle(candidate: Any) -> bool:
+                if not isinstance(candidate, dict):
+                    return False
+                return (
+                    self._has_meaningful_payload(candidate.get("growth"))
+                    or self._has_meaningful_payload(candidate.get("earnings"))
+                    or self._has_meaningful_payload(candidate.get("institution"))
+                )
+
+            for fetcher in self._fetchers:
+                if not hasattr(fetcher, "get_fundamental_bundle"):
+                    continue
+                if remaining_seconds <= 0:
+                    break
+                provider = getattr(fetcher, "name", fetcher.__class__.__name__)
+                fetch_timeout_for_bundle = min(fetch_timeout, remaining_seconds)
+                fetch_payload, fetch_err_msg, fetch_ms = self._run_with_retry(
+                    lambda f=fetcher: f.get_fundamental_bundle(stock_code),
+                    fetch_timeout_for_bundle,
+                    f"fundamental_bundle:{provider}",
+                )
+                _consume_budget(fetch_ms)
+                if isinstance(fetch_payload, dict) and _has_usable_bundle(fetch_payload):
+                    bundle_payload = fetch_payload
+                    bundle_err_msg = fetch_err_msg
+                    bundle_ms = fetch_ms
+                    break
+                bundle_source_prefix.append(
+                    {
+                        "provider": provider,
+                        "result": "failed" if fetch_err_msg else "empty",
+                        "duration_ms": fetch_ms,
+                        **({"error": fetch_err_msg} if fetch_err_msg else {}),
+                    }
+                )
+                if isinstance(fetch_payload, dict):
+                    bundle_fallback_errors.extend(str(e) for e in fetch_payload.get("errors", []) if e)
+                if fetch_err_msg:
+                    bundle_fallback_errors.append(fetch_err_msg)
+
+            if bundle_payload is None and remaining_seconds > 0:
+                bundle_timeout = min(fetch_timeout, remaining_seconds)
+                bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
+                    lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
+                    bundle_timeout,
+                    "fundamental_bundle",
+                )
+                _consume_budget(bundle_ms)
             if not isinstance(bundle_payload, dict):
                 bundle_status = "failed"
                 bundle_payload = {}
-                bundle_errors = ["fundamental_bundle failed"]
+                bundle_errors = bundle_fallback_errors + ["fundamental_bundle failed"]
                 if bundle_err_msg:
                     bundle_errors.append(bundle_err_msg)
             else:
                 bundle_status = str(bundle_payload.get("status", "not_supported"))
-                bundle_errors = [bundle_err_msg] if bundle_err_msg else []
+                bundle_errors = bundle_fallback_errors + ([bundle_err_msg] if bundle_err_msg else [])
 
-        bundle_chain = self._normalize_source_chain(
+        bundle_chain_prefix = locals().get("bundle_source_prefix", [])
+        bundle_chain = bundle_chain_prefix + self._normalize_source_chain(
             bundle_payload.get("source_chain", []),
             "fundamental_bundle",
             bundle_status,
             bundle_ms,
-        ) if isinstance(bundle_payload, dict) else self._normalize_source_chain(
+        ) if isinstance(bundle_payload, dict) else bundle_chain_prefix + self._normalize_source_chain(
             None,
             "fundamental_bundle",
             bundle_status,
@@ -3434,17 +3482,65 @@ class DataFetcherManager:
                 [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
                 ["fundamental stage timeout"],
             )
-        payload, err, cost_ms = self._run_with_retry(
-            lambda: self._fundamental_adapter.get_capital_flow(stock_code),
-            timeout,
-            "capital_flow",
-        )
+        source_chain_prefix: List[Dict[str, Any]] = []
+        fallback_errors: List[str] = []
+
+        def _has_usable_capital_flow(candidate: Any) -> bool:
+            if not isinstance(candidate, dict):
+                return False
+            stock_flow = candidate.get("stock_flow") or {}
+            if isinstance(stock_flow, dict) and any(v is not None for v in stock_flow.values()):
+                return True
+            sector_rankings = candidate.get("sector_rankings") or {}
+            return bool(
+                isinstance(sector_rankings, dict)
+                and (sector_rankings.get("top") or sector_rankings.get("bottom"))
+            )
+
+        payload = None
+        err = None
+        cost_ms = 0
+        for fetcher in self._fetchers:
+            if not hasattr(fetcher, "get_capital_flow"):
+                continue
+            provider = getattr(fetcher, "name", fetcher.__class__.__name__)
+            fetch_payload, fetch_err, fetch_cost_ms = self._run_with_retry(
+                lambda f=fetcher: f.get_capital_flow(stock_code),
+                timeout,
+                f"capital_flow:{provider}",
+            )
+            if isinstance(fetch_payload, dict) and _has_usable_capital_flow(fetch_payload):
+                payload = fetch_payload
+                err = fetch_err
+                cost_ms = fetch_cost_ms
+                break
+            source_chain_prefix.append(
+                {
+                    "provider": provider,
+                    "result": "failed" if fetch_err else "empty",
+                    "duration_ms": fetch_cost_ms,
+                    **({"error": fetch_err} if fetch_err else {}),
+                }
+            )
+            if isinstance(fetch_payload, dict):
+                fallback_errors.extend(str(e) for e in fetch_payload.get("errors", []) if e)
+            if fetch_err:
+                fallback_errors.append(fetch_err)
+
+        if payload is None:
+            payload, err, cost_ms = self._run_with_retry(
+                lambda: self._fundamental_adapter.get_capital_flow(stock_code),
+                timeout,
+                "capital_flow",
+            )
         if not isinstance(payload, dict):
             return self._build_fundamental_block(
                 "failed",
                 {},
-                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": cost_ms}],
-                [err or "capital_flow failed"],
+                source_chain_prefix + [
+                    {"provider": "fundamental_pipeline", "result": "failed", "duration_ms": cost_ms}
+                ],
+                fallback_errors + [err or "capital_flow failed"],
             )
 
         stock_flow = payload.get("stock_flow") or {}
@@ -3467,13 +3563,13 @@ class DataFetcherManager:
                 "stock_flow": payload.get("stock_flow", {}),
                 "sector_rankings": payload.get("sector_rankings", {}),
             },
-            self._normalize_source_chain(
+            source_chain_prefix + self._normalize_source_chain(
                 payload.get("source_chain", []),
                 "capital_flow",
                 capital_flow_status,
                 cost_ms,
             ),
-            list(payload.get("errors", [])) + ([err] if err else []),
+            fallback_errors + list(payload.get("errors", [])) + ([err] if err else []),
         )
 
     def get_dragon_tiger_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
